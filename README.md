@@ -17,6 +17,9 @@ Application / SQL
                                       ClickHouse Kafka Engine
                                                 |
                                                 v
+                                      Materialized View
+                                                |
+                                                v
                                       ReplacingMergeTree
 ```
 
@@ -25,7 +28,7 @@ Application / SQL
 - PostgreSQL 16 with logical replication enabled
 - Apache Kafka in KRaft mode (no ZooKeeper)
 - Debezium PostgreSQL connector
-- ClickHouse with a Kafka Engine source table and materialized view
+- ClickHouse Kafka Engine source table, materialized view, and ReplacingMergeTree target
 - Optional Go consumer (planned extension)
 
 ## Quick start
@@ -39,7 +42,13 @@ cp .env.example .env
 docker compose up -d
 ```
 
-Register the Debezium connector:
+Wait for the services to become healthy, then register the Debezium connector:
+
+```bash
+./scripts/register-connector.sh
+```
+
+The equivalent REST request is:
 
 ```bash
 curl -i -X POST http://localhost:8083/connectors \
@@ -53,7 +62,9 @@ Check connector status:
 curl -s http://localhost:8083/connectors/inventory-connector/status | jq
 ```
 
-Insert and update sample rows:
+## Generate CDC events
+
+Insert, update, and delete a customer:
 
 ```bash
 docker compose exec postgres psql -U cdc -d inventory -c \
@@ -61,6 +72,9 @@ docker compose exec postgres psql -U cdc -d inventory -c \
 
 docker compose exec postgres psql -U cdc -d inventory -c \
   "UPDATE public.customers SET email = 'ada.lovelace@example.com' WHERE name = 'Ada Lovelace';"
+
+docker compose exec postgres psql -U cdc -d inventory -c \
+  "DELETE FROM public.customers WHERE name = 'Ada Lovelace';"
 ```
 
 Inspect Kafka messages:
@@ -71,28 +85,53 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --topic dbserver1.public.customers --from-beginning
 ```
 
-Query ClickHouse:
+Query the latest customer state in ClickHouse:
 
 ```bash
 docker compose exec clickhouse clickhouse-client \
-  --query "SELECT * FROM cdc.customers FINAL ORDER BY id"
+  --user default --password clickhouse \
+  --query "SELECT id, name, email FROM cdc.customers FINAL WHERE is_deleted = 0 ORDER BY id"
 ```
+
+Run the end-to-end smoke test after registering the connector:
+
+```bash
+./scripts/smoke-test.sh
+```
+
+The smoke test sends INSERT, UPDATE, and DELETE statements to PostgreSQL and polls ClickHouse for the expected state. It requires Docker Compose, curl, and a running stack.
 
 ## Local endpoints
 
 | Service | Endpoint | Credentials |
 |---|---|---|
 | PostgreSQL | localhost:5432 | cdc / cdc |
-| Kafka | localhost:9092 | PLAINTEXT |
+| Kafka (host access) | localhost:29092 | PLAINTEXT |
+| Kafka (Compose network) | kafka:9092 | PLAINTEXT |
 | Kafka Connect REST | http://localhost:8083 | — |
-| ClickHouse HTTP | http://localhost:8123 | default user, no password |
-| ClickHouse native | localhost:9000 | default user, no password |
+| ClickHouse HTTP | http://localhost:8123 | default / clickhouse |
+| ClickHouse native | localhost:9000 | default / clickhouse |
+
+Credentials in `.env.example` are for local development only. Change them before exposing services beyond your machine.
+
+## Data model and CDC semantics
+
+- PostgreSQL source table: `public.customers`
+- Kafka topic: `dbserver1.public.customers`
+- ClickHouse raw Kafka table: `cdc.customers_kafka`
+- ClickHouse materialized view: `cdc.customers_consumer`
+- ClickHouse current-state target: `cdc.customers`
+
+The materialized view projects Debezium create, update, delete, and snapshot-read events into the target table. Delete events are represented as rows with `is_deleted = 1`; normal reads should use `FINAL` and filter `is_deleted = 0`.
+
+This is an educational baseline. Event timestamps are used as the ReplacingMergeTree version in this first iteration, so multiple source changes within the same millisecond can require a stronger source-ordering key before correctness-sensitive use. Schema changes, replay strategy, and Kafka offset recovery also need explicit production treatment.
 
 ## Important notes
 
 - This is a local development/demo stack, not a production deployment.
-- The ClickHouse Kafka Engine is a streaming ingestion mechanism. ReplacingMergeTree deduplicates versions during merges; use `FINAL` when you need query-time replacement semantics.
-- Debezium emits delete events and tombstones. The initial ClickHouse projection is intentionally a learning baseline; validate delete/tombstone behavior before relying on it for correctness-sensitive workloads.
+- ReplacingMergeTree performs replacement during merges; use `FINAL` when query-time replacement semantics are required.
+- Debezium's PostgreSQL connector uses the `pgoutput` logical decoding plugin and the `dbz_publication` publication created by the PostgreSQL init script.
+- The PostgreSQL init scripts run only when the data volume is first created. To recreate the database from scratch, use `docker compose down -v` (this destroys local data).
 - Pin and review image versions before using this stack outside local development.
 
 ## Project roadmap
@@ -102,15 +141,15 @@ docker compose exec clickhouse clickhouse-client \
 - [x] Debezium connector configuration
 - [x] Kafka-to-ClickHouse ingestion baseline
 - [ ] Go consumer with graceful shutdown, retries, and structured logging
-- [ ] Automated end-to-end INSERT / UPDATE / DELETE tests
+- [ ] Run and harden automated end-to-end INSERT / UPDATE / DELETE tests
 - [ ] Metrics, dashboards, and failure-recovery documentation
 - [ ] Idempotency, schema evolution, and production hardening
 
 ## Troubleshooting
 
 - Connector fails to start: check `docker compose logs connect` and confirm PostgreSQL is healthy.
-- No Kafka topic: inspect connector status and `docker compose logs connect`.
-- No ClickHouse rows: check `docker compose logs clickhouse`, then inspect `SELECT * FROM cdc.customers_kafka LIMIT 10`.
+- No Kafka topic: inspect `curl http://localhost:8083/connectors/inventory-connector/status` and `docker compose logs connect`.
+- No ClickHouse rows: inspect `SELECT * FROM cdc.customers_kafka LIMIT 10` and `docker compose logs clickhouse`.
 - Reset the local environment (destroys local volumes): `docker compose down -v`.
 
 ## License
