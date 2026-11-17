@@ -45,7 +45,7 @@ docker compose up -d
 Wait for the services to become healthy, then register the Debezium connector:
 
 ```bash
-./scripts/register-connector.sh
+bash scripts/register-connector.sh
 ```
 
 The equivalent REST request is:
@@ -96,7 +96,7 @@ docker compose exec clickhouse clickhouse-client \
 Run the end-to-end smoke test after registering the connector:
 
 ```bash
-./scripts/smoke-test.sh
+bash scripts/smoke-test.sh
 ```
 
 The smoke test sends INSERT, UPDATE, and DELETE statements to PostgreSQL and polls ClickHouse for the expected state. It requires Docker Compose, curl, and a running stack.
